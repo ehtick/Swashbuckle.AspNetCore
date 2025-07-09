@@ -1,5 +1,6 @@
 ﻿using System.IO.Compression;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.Builder;
 using Swashbuckle.AspNetCore.ReDoc;
@@ -10,6 +11,8 @@ namespace Swashbuckle.AspNetCore.IntegrationTests;
 [Collection("TestSite")]
 public class ReDocIntegrationTests(ITestOutputHelper outputHelper)
 {
+    private const string EmptyStringSha256Hash = "2jmj7l5rSw0yVb/vlWAYkK/YBwk=";
+
     [Fact]
     public async Task RoutePrefix_RedirectsToIndexUrl()
     {
@@ -25,12 +28,14 @@ public class ReDocIntegrationTests(ITestOutputHelper outputHelper)
     [Fact]
     public async Task IndexUrl_ReturnsEmbeddedVersionOfTheRedocUI()
     {
+        var cancellationToken = TestContext.Current.CancellationToken;
+
         var site = new TestSite(typeof(ReDocApp.Startup), outputHelper);
         using var client = site.BuildClient();
 
-        using var htmlResponse = await client.GetAsync("/api-docs/index.html", TestContext.Current.CancellationToken);
-        using var cssResponse = await client.GetAsync("/api-docs/index.css", TestContext.Current.CancellationToken);
-        using var jsResponse = await client.GetAsync("/api-docs/redoc.standalone.js", TestContext.Current.CancellationToken);
+        using var htmlResponse = await client.GetAsync("/api-docs/index.html", cancellationToken);
+        using var cssResponse = await client.GetAsync("/api-docs/index.css", cancellationToken);
+        using var jsResponse = await client.GetAsync("/api-docs/redoc.standalone.js", cancellationToken);
 
         AssertResource(htmlResponse);
         AssertResource(cssResponse);
@@ -51,11 +56,13 @@ public class ReDocIntegrationTests(ITestOutputHelper outputHelper)
     [Fact]
     public async Task RedocMiddleware_ReturnsInitializerScript()
     {
+        var cancellationToken = TestContext.Current.CancellationToken;
+
         var site = new TestSite(typeof(ReDocApp.Startup), outputHelper);
         using var client = site.BuildClient();
 
-        using var response = await client.GetAsync("/api-docs/index.js", TestContext.Current.CancellationToken);
-        var content = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var response = await client.GetAsync("/api-docs/index.js", cancellationToken);
+        var content = await response.Content.ReadAsStringAsync(cancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Contains("Redoc.init", content);
@@ -68,13 +75,15 @@ public class ReDocIntegrationTests(ITestOutputHelper outputHelper)
     [Fact]
     public async Task IndexUrl_IgnoresUrlCase()
     {
+        var cancellationToken = TestContext.Current.CancellationToken;
+
         var site = new TestSite(typeof(ReDocApp.Startup), outputHelper);
         using var client = site.BuildClient();
 
-        using var htmlResponse = await client.GetAsync("/Api-Docs/index.html", TestContext.Current.CancellationToken);
-        using var cssResponse = await client.GetAsync("/Api-Docs/index.css", TestContext.Current.CancellationToken);
-        using var jsInitResponse = await client.GetAsync("/Api-Docs/index.js", TestContext.Current.CancellationToken);
-        using var jsRedocResponse = await client.GetAsync("/Api-Docs/redoc.standalone.js", TestContext.Current.CancellationToken);
+        using var htmlResponse = await client.GetAsync("/Api-Docs/index.html", cancellationToken);
+        using var cssResponse = await client.GetAsync("/Api-Docs/index.css", cancellationToken);
+        using var jsInitResponse = await client.GetAsync("/Api-Docs/index.js", cancellationToken);
+        using var jsRedocResponse = await client.GetAsync("/Api-Docs/redoc.standalone.js", cancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, htmlResponse.StatusCode);
         Assert.Equal(HttpStatusCode.OK, cssResponse.StatusCode);
@@ -87,12 +96,14 @@ public class ReDocIntegrationTests(ITestOutputHelper outputHelper)
     [InlineData("/redoc/2.0/index.html", "/redoc/2.0/index.js", "/swagger/2.0/swagger.json")]
     public async Task RedocMiddleware_CanBeConfiguredMultipleTimes(string htmlUrl, string jsUrl, string swaggerPath)
     {
+        var cancellationToken = TestContext.Current.CancellationToken;
+
         var site = new TestSite(typeof(MultipleVersions.Startup), outputHelper);
         using var client = site.BuildClient();
 
-        using var htmlResponse = await client.GetAsync(htmlUrl, TestContext.Current.CancellationToken);
-        using var jsResponse = await client.GetAsync(jsUrl, TestContext.Current.CancellationToken);
-        var content = await jsResponse.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        using var htmlResponse = await client.GetAsync(htmlUrl, cancellationToken);
+        using var jsResponse = await client.GetAsync(jsUrl, cancellationToken);
+        var content = await jsResponse.Content.ReadAsStringAsync(cancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, htmlResponse.StatusCode);
         Assert.Equal(HttpStatusCode.OK, jsResponse.StatusCode);
@@ -165,40 +176,125 @@ public class ReDocIntegrationTests(ITestOutputHelper outputHelper)
         Assert.True(options.ConfigObject.UntrustedSpec);
     }
 
-    [Fact]
-    public async Task ReDocMiddleware_Returns_ExpectedAssetContents()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("gzip;q=0, identity; q=0.5, *;q=0")]
+    [InlineData("deflate, br, zstd")]
+    public async Task ReDocMiddleware_Returns_ExpectedAssetContents_Decompressed(string acceptEncoding)
     {
+        // Arrange
+        var cancellationToken = TestContext.Current.CancellationToken;
+
         var site = new TestSite(typeof(ReDocApp.Startup), outputHelper);
         using var client = site.BuildClient();
 
-        using var htmlResponse = await client.GetAsync("/Api-Docs/redoc.standalone.js", TestContext.Current.CancellationToken);
-        Assert.Equal(HttpStatusCode.OK, htmlResponse.StatusCode);
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/Api-Docs/redoc.standalone.js");
 
-        using var stream = await htmlResponse.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken);
-        using var rawFileStream = typeof(ReDocIntegrationTests).Assembly.GetManifestResourceStream("Swashbuckle.AspNetCore.IntegrationTests.Embedded.ReDoc.redoc.standalone.js");
+        var encodings = acceptEncoding?.Split(',')
+            .Select((p) => p.Trim())
+            .ToList();
 
-        Assert.NotNull(rawFileStream);
-        Assert.Equal(SHA1.HashData(rawFileStream), SHA1.HashData(stream));
+        foreach (var encoding in encodings ?? [])
+        {
+            request.Headers.AcceptEncoding.Add(StringWithQualityHeaderValue.Parse(encoding));
+        }
+
+        // Act
+        using var response = await client.SendAsync(request, cancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/javascript", response.Content.Headers.ContentType?.MediaType);
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+
+        using var actual = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var expected = typeof(ReDocIntegrationTests).Assembly.GetManifestResourceStream("Swashbuckle.AspNetCore.IntegrationTests.Embedded.ReDoc.redoc.standalone.js");
+
+        Assert.NotNull(actual);
+        Assert.NotNull(expected);
+
+        Assert.NotEqual(0, actual.Length);
+        Assert.NotEqual(0, expected.Length);
+
+        var actualHash = SHA1.HashData(actual);
+        var expectedHash = SHA1.HashData(expected);
+
+        Assert.NotEqual(EmptyStringSha256Hash, Convert.ToBase64String(actualHash));
+        Assert.Equal(expectedHash, actualHash);
+
+        Assert.NotNull(response.Headers.ETag);
+        Assert.False(response.Headers.ETag.IsWeak);
+        Assert.NotEmpty(response.Headers.ETag.Tag);
+        Assert.DoesNotContain(EmptyStringSha256Hash, response.Headers.ETag.Tag);
+
+        Assert.NotNull(response.Headers.CacheControl);
+        Assert.True(response.Headers.CacheControl.Private);
+        Assert.Equal(TimeSpan.FromDays(7), response.Headers.CacheControl.MaxAge);
+
+        Assert.Equal(response.Content.Headers.ContentLength, actual.Length);
     }
 
-    [Fact]
-    public async Task ReDocMiddleware_Returns_ExpectedAssetContents_GZipDirectly()
+    [Theory]
+    [InlineData("gzip")]
+    [InlineData("gzip;q=1.0, identity; q=0.5, *;q=0")]
+    [InlineData("gzip, deflate, br, zstd")]
+    public async Task ReDocMiddleware_Returns_ExpectedAssetContents_GZip_Compressed(string acceptEncoding)
     {
+        // Arrange
+        var cancellationToken = TestContext.Current.CancellationToken;
+
         var site = new TestSite(typeof(ReDocApp.Startup), outputHelper);
         using var client = site.BuildClient();
 
-        using var requestMessage = new HttpRequestMessage(HttpMethod.Get, "/Api-Docs/redoc.standalone.js");
-        requestMessage.Headers.AcceptEncoding.Add(new("gzip"));
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/Api-Docs/redoc.standalone.js");
 
-        using var htmlResponse = await client.SendAsync(requestMessage, TestContext.Current.CancellationToken);
-        Assert.Equal(HttpStatusCode.OK, htmlResponse.StatusCode);
-        Assert.Equal("gzip", htmlResponse.Content.Headers.ContentEncoding.Single());
+        var encodings = acceptEncoding.Split(',')
+            .Select((p) => p.Trim())
+            .ToList();
 
-        using var stream = await htmlResponse.Content.ReadAsStreamAsync(TestContext.Current.CancellationToken);
-        using var gzipStream = new GZipStream(stream, CompressionMode.Decompress);
-        using var rawFileStream = typeof(ReDocIntegrationTests).Assembly.GetManifestResourceStream("Swashbuckle.AspNetCore.IntegrationTests.Embedded.ReDoc.redoc.standalone.js");
+        foreach (var encoding in encodings)
+        {
+            request.Headers.AcceptEncoding.Add(StringWithQualityHeaderValue.Parse(encoding));
+        }
 
-        Assert.NotNull(rawFileStream);
-        Assert.Equal(SHA1.HashData(rawFileStream), SHA1.HashData(gzipStream));
+        // Act
+        using var response = await client.SendAsync(request, cancellationToken);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/javascript", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(["gzip"], [.. response.Content.Headers.ContentEncoding]);
+
+        using var actual = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var expected = typeof(ReDocIntegrationTests).Assembly.GetManifestResourceStream("Swashbuckle.AspNetCore.IntegrationTests.Embedded.ReDoc.redoc.standalone.js");
+
+        Assert.NotNull(actual);
+        Assert.NotNull(expected);
+
+        Assert.NotEqual(0, actual.Length);
+        Assert.NotEqual(0, expected.Length);
+
+        using var decompressed = new GZipStream(actual, CompressionMode.Decompress);
+
+        Assert.True(
+            actual.Length < expected.Length,
+            $"The compressed length ({actual.Length}) was not less than the decompressed length ({expected.Length}).");
+
+        var actualHash = SHA1.HashData(decompressed);
+        var expectedHash = SHA1.HashData(expected);
+
+        Assert.NotEqual(EmptyStringSha256Hash, Convert.ToBase64String(actualHash));
+        Assert.Equal(expectedHash, actualHash);
+
+        Assert.NotNull(response.Headers.ETag);
+        Assert.False(response.Headers.ETag.IsWeak);
+        Assert.NotEmpty(response.Headers.ETag.Tag);
+        Assert.DoesNotContain(EmptyStringSha256Hash, response.Headers.ETag.Tag);
+
+        Assert.NotNull(response.Headers.CacheControl);
+        Assert.True(response.Headers.CacheControl.Private);
+        Assert.Equal(TimeSpan.FromDays(7), response.Headers.CacheControl.MaxAge);
+
+        Assert.Equal(response.Content.Headers.ContentLength, actual.Length);
     }
 }

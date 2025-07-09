@@ -10,21 +10,16 @@ namespace Swashbuckle.AspNetCore.ReDoc;
 
 internal sealed class ReDocMiddleware
 {
-    private const string EmbeddedFileNamespace = "Swashbuckle.AspNetCore.ReDoc.node_modules.redoc.bundles";
-
     private static readonly string ReDocVersion = GetReDocVersion();
 
     private readonly RequestDelegate _next;
     private readonly ReDocOptions _options;
     private readonly JsonSerializerOptions _jsonSerializerOptions;
+    private readonly EmbeddedResourceProvider _resourceProvider;
 
-    private readonly CompressedEmbeddedFileResponder _compressedEmbeddedFileResponder;
-
-    public ReDocMiddleware(
-        RequestDelegate next,
-        ReDocOptions options)
+    public ReDocMiddleware(RequestDelegate next, ReDocOptions options)
     {
-        _next = next ?? throw new ArgumentNullException(nameof(next));
+        _next = next;
         _options = options ?? new ReDocOptions();
 
         if (options.JsonSerializerOptions != null)
@@ -33,14 +28,16 @@ internal sealed class ReDocMiddleware
         }
 
         var pathPrefix = options.RoutePrefix.StartsWith('/') ? options.RoutePrefix : $"/{options.RoutePrefix}";
-        _compressedEmbeddedFileResponder = new(typeof(ReDocMiddleware).Assembly, EmbeddedFileNamespace, pathPrefix, _options.CacheLifetime);
+        _resourceProvider = new(
+            typeof(ReDocMiddleware).Assembly,
+            "Swashbuckle.AspNetCore.ReDoc.node_modules.redoc.bundles",
+            pathPrefix,
+            _options.CacheLifetime);
     }
 
     public async Task Invoke(HttpContext httpContext)
     {
-        var httpMethod = httpContext.Request.Method;
-
-        if (HttpMethods.IsGet(httpMethod))
+        if (HttpMethods.IsGet(httpContext.Request.Method))
         {
             var path = httpContext.Request.Path.Value;
 
@@ -61,30 +58,29 @@ internal sealed class ReDocMiddleware
 
             if (match.Success)
             {
-                await RespondWithFile(httpContext.Response, match.Groups[1].Value);
+                await RespondWithFile(httpContext.Response, match.Groups[1].Value, httpContext.RequestAborted);
                 return;
             }
         }
 
-        if (!await _compressedEmbeddedFileResponder.TryRespondWithFileAsync(httpContext))
+        if (!await _resourceProvider.TryRespondWithFileAsync(httpContext))
         {
             await _next(httpContext);
         }
     }
 
     private static string GetReDocVersion()
-    {
-        return typeof(ReDocMiddleware).Assembly
-            .GetCustomAttributes<AssemblyMetadataAttribute>()
-            .Where((p) => p.Key is "ReDocVersion")
-            .Select((p) => p.Value)
-            .DefaultIfEmpty(string.Empty)
-            .FirstOrDefault();
-    }
+        => typeof(ReDocMiddleware).Assembly
+               .GetCustomAttributes<AssemblyMetadataAttribute>()
+               .Where((p) => p.Key is "ReDocVersion")
+               .Select((p) => p.Value)
+               .DefaultIfEmpty(string.Empty)
+               .FirstOrDefault();
 
-    private static void SetCacheHeaders(HttpResponse response, ReDocOptions options, string etag = null)
+    private static void SetHeaders(HttpResponse response, ReDocOptions options, string etag)
     {
         var headers = response.GetTypedHeaders();
+        headers.Append("x-redoc-version", ReDocVersion);
 
         if (options.CacheLifetime is { } maxAge)
         {
@@ -103,7 +99,7 @@ internal sealed class ReDocMiddleware
             };
         }
 
-        headers.ETag = new($"\"{etag ?? ReDocVersion}\"", isWeak: true);
+        headers.ETag = new($"\"{etag}\"", isWeak: true);
     }
 
     private static void RespondWithRedirect(HttpResponse response, string location)
@@ -112,9 +108,12 @@ internal sealed class ReDocMiddleware
         response.Headers.Location = location;
     }
 
-    private async Task RespondWithFile(HttpResponse response, string fileName)
+    private async Task RespondWithFile(
+        HttpResponse response,
+        string fileName,
+        CancellationToken cancellationToken)
     {
-        response.StatusCode = 200;
+        response.StatusCode = StatusCodes.Status200OK;
 
         Stream stream;
 
@@ -124,10 +123,12 @@ internal sealed class ReDocMiddleware
                 response.ContentType = "text/css";
                 stream = ResourceHelper.GetEmbeddedResource(fileName);
                 break;
+
             case "index.js":
                 response.ContentType = "application/javascript;charset=utf-8";
                 stream = ResourceHelper.GetEmbeddedResource(fileName);
                 break;
+
             default:
                 response.ContentType = "text/html;charset=utf-8";
                 stream = _options.IndexStream();
@@ -137,7 +138,15 @@ internal sealed class ReDocMiddleware
         using (stream)
         {
             // Inject arguments before writing to response
-            var content = new StringBuilder(new StreamReader(stream).ReadToEnd());
+            string template;
+
+            using (var reader = new StreamReader(stream))
+            {
+                template = await reader.ReadToEndAsync(cancellationToken);
+            }
+
+            var content = new StringBuilder(template);
+
             foreach (var entry in GetIndexArguments())
             {
                 content.Replace(entry.Key, entry.Value);
@@ -146,18 +155,18 @@ internal sealed class ReDocMiddleware
             var text = content.ToString();
             var etag = HashText(text);
 
-            SetCacheHeaders(response, _options, etag);
+            SetHeaders(response, _options, etag);
 
-            await response.WriteAsync(text, Encoding.UTF8);
+            await response.WriteAsync(text, Encoding.UTF8, cancellationToken);
         }
-    }
 
-    private static string HashText(string text)
-    {
-        var buffer = Encoding.UTF8.GetBytes(text);
-        var hash = SHA1.HashData(buffer);
+        static string HashText(string text)
+        {
+            var buffer = Encoding.UTF8.GetBytes(text);
+            var hash = SHA1.HashData(buffer);
 
-        return Convert.ToBase64String(hash);
+            return Convert.ToBase64String(hash);
+        }
     }
 
     [UnconditionalSuppressMessage(
